@@ -1,17 +1,13 @@
 """
 Agent prospection café Éthiopie
-Scraping direct : Google + annuaires éthiopiens
-Bibliothèques  : requests + beautifulsoup4 (100% gratuit, zéro clé)
-Résultat       : data/companies_master.csv + data/companies_latest.csv
+Méthode : Claude fait lui-même la recherche web (outil natif Anthropic)
+Zéro dépendance externe — uniquement la clé ANTHROPIC_API_KEY
 """
 
 import os, csv, json, hashlib, re, time
 from datetime import datetime
-import requests
-from bs4 import BeautifulSoup
 import anthropic
 
-# ── Config ────────────────────────────────────────────────────────────────────
 API_KEY  = os.environ["ANTHROPIC_API_KEY"]
 RUN_NUM  = int(os.environ.get("GITHUB_RUN_NUMBER", "0"))
 NOW      = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
@@ -20,131 +16,101 @@ MASTER   = f"{DATA_DIR}/companies_master.csv"
 LATEST   = f"{DATA_DIR}/companies_latest.csv"
 FIELDS   = ["company_name", "city", "email", "phone", "website", "first_seen"]
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-}
-
-# ── 8 batches de requêtes en rotation ────────────────────────────────────────
 BATCHES = [
-    ["Ethiopian coffee export company contact email phone",
-     "Ethiopia coffee trading company Addis Ababa contact"],
-    ["Sidama coffee company Ethiopia email phone",
-     "Yirgacheffe coffee producer exporter Ethiopia contact"],
-    ["Jimma coffee Ethiopia company phone email",
-     "Kaffa coffee Ethiopia exporter contact details"],
-    ["Ethiopian coffee farmers cooperative union contact email",
-     "Oromia coffee cooperative Ethiopia phone"],
-    ["coffee roaster Ethiopia company email contact",
-     "specialty coffee Ethiopia roasting company phone"],
-    ["coffee packaging supplier Ethiopia email contact",
-     "Ethiopia coffee bag manufacturer phone"],
-    ["Ethiopia coffee company directory yellowpages",
-     "Addis Ababa coffee business directory email phone"],
-    ["green coffee bean supplier Ethiopia email phone",
-     "Ethiopia coffee wholesale exporter contact"],
+    [
+        "Find Ethiopian coffee export companies with their email address and phone number in Addis Ababa",
+        "List coffee trading companies based in Ethiopia with contact details email phone",
+    ],
+    [
+        "Find Sidama and Yirgacheffe coffee producer companies in Ethiopia with email and phone",
+        "Ethiopian coffee cooperative union contact email phone number list",
+    ],
+    [
+        "Coffee roaster companies in Ethiopia Addis Ababa with email contact",
+        "Jimma Kaffa coffee exporter Ethiopia company email phone",
+    ],
+    [
+        "Ethiopian specialty coffee company export contact email phone website",
+        "Oromia coffee farmers cooperative Ethiopia contact details",
+    ],
+    [
+        "Coffee packaging supplier company Ethiopia email phone contact",
+        "Ethiopia green coffee bean exporter company contact email",
+    ],
+    [
+        "Ethiopian coffee company directory listing email phone Addis Ababa",
+        "Coffee producer Ethiopia wholesale supplier contact information",
+    ],
+    [
+        "Ethiopia coffee association member companies email phone",
+        "Addis Ababa coffee importer exporter company contact email phone",
+    ],
+    [
+        "Ethiopian coffee brand company website email contact phone",
+        "Coffee processing company Ethiopia contact details email",
+    ],
 ]
 
-# Sources directes à scraper
-DIRECT_SOURCES = [
-    "https://www.yellowpages.com.et/search?keyword=coffee",
-    "https://www.addisbiz.com/search?q=coffee",
-    "https://ethiopianbusinessdirectory.com/coffee",
-    "https://www.biznet.et/search/coffee",
-]
+PROMPT = """Search the web and find Ethiopian companies working in the coffee industry 
+(exporters, producers, cooperatives, roasters, packaging suppliers).
 
-# ── Google scrape ─────────────────────────────────────────────────────────────
-def google_search(query: str) -> str:
-    try:
-        q = requests.utils.quote(query)
-        url = f"https://www.google.com/search?q={q}&num=10&hl=en"
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        soup = BeautifulSoup(resp.text, "html.parser")
+For this search: {query}
 
-        parts = []
-        # Titres + snippets des résultats organiques
-        for g in soup.select("div.g")[:10]:
-            title = g.select_one("h3")
-            snippet = g.select_one("div.VwiC3b") or g.select_one("span.aCOpRe")
-            link = g.select_one("a")
-            if title:
-                parts.append(f"Titre: {title.get_text()}")
-            if snippet:
-                parts.append(f"Extrait: {snippet.get_text()}")
-            if link and link.get("href","").startswith("http"):
-                parts.append(f"URL: {link['href']}")
-            parts.append("---")
-
-        result = "\n".join(parts)
-        print(f"  → Google : {len(soup.select('div.g'))} résultats")
-        return result
-    except Exception as e:
-        print(f"  ⚠ Google : {e}")
-        return ""
-
-# ── Scrape annuaires directs ───────────────────────────────────────────────────
-def scrape_directory(url: str) -> str:
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        if resp.status_code != 200:
-            return ""
-        soup = BeautifulSoup(resp.text, "html.parser")
-        # Extraire tout le texte visible
-        text = soup.get_text(separator="\n", strip=True)
-        # Garder seulement les lignes utiles (email, phone, nom)
-        lines = [l for l in text.splitlines() if len(l) > 5][:80]
-        return "\n".join(lines)
-    except Exception as e:
-        print(f"  ⚠ Annuaire {url} : {e}")
-        return ""
-
-# ── Extraction Claude ─────────────────────────────────────────────────────────
-PROMPT = """Voici des résultats de recherche sur les entreprises éthiopiennes du café.
-
-{results}
-
-Extrais TOUTES les entreprises éthiopiennes liées au café (producteurs, exportateurs,
-coopératives, torréfacteurs, emballage café).
-
-Réponds UNIQUEMENT avec du JSON valide entre <json> et </json> :
+After searching, extract ALL companies you find and respond ONLY with valid JSON between <json> and </json> tags:
 
 <json>
 [
   {{
-    "company_name": "Nom exact",
-    "city": "Ville en Ethiopie ou vide",
-    "email": "email ou vide",
-    "phone": "+251... ou vide",
-    "website": "https://... ou vide"
+    "company_name": "Exact company name",
+    "city": "City in Ethiopia or empty",
+    "email": "email@example.com or empty",
+    "phone": "+251... or empty",
+    "website": "https://... or empty"
   }}
 ]
 </json>
 
-Ne jamais inventer — laisser vide si inconnu. Si rien trouvé : <json>[]</json>"""
+Rules:
+- Only Ethiopian companies related to coffee
+- Never invent data — leave field empty if unknown
+- If nothing found: <json>[]</json>"""
 
-def extract(results_text: str) -> list[dict]:
-    if not results_text.strip():
-        return []
+
+def search_and_extract(query: str) -> list[dict]:
     client = anthropic.Anthropic(api_key=API_KEY)
     try:
         resp = client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=2000,
-            messages=[{"role": "user", "content": PROMPT.format(
-                results=results_text[:5000]
-            )}],
+            tools=[{
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": 3
+            }],
+            messages=[{"role": "user", "content": PROMPT.format(query=query)}],
         )
-        text = resp.content[0].text
-        match = re.search(r"<json>(.*?)</json>", text, re.DOTALL)
+
+        # Récupérer tout le texte de la réponse finale
+        full_text = ""
+        for block in resp.content:
+            if hasattr(block, "text"):
+                full_text += block.text
+
+        print(f"  → Réponse reçue ({len(full_text)} chars)")
+
+        match = re.search(r"<json>(.*?)</json>", full_text, re.DOTALL)
         if not match:
+            print("  ⚠ Pas de JSON trouvé")
             return []
-        return json.loads(match.group(1).strip())
+
+        data = json.loads(match.group(1).strip())
+        return data
+
     except Exception as e:
-        print(f"  ⚠ Claude : {e}")
+        print(f"  ⚠ Erreur : {e}")
         return []
 
-# ── CSV master ────────────────────────────────────────────────────────────────
+
 def _key(name: str) -> str:
     return hashlib.md5(name.lower().strip().encode()).hexdigest()
 
@@ -162,8 +128,14 @@ def merge(new_items: list[dict], master: dict) -> tuple[dict, int]:
             continue
         k = _key(name)
         if k not in master:
-            master[k] = {f: c.get(f, "") for f in FIELDS[:-1]}
-            master[k]["first_seen"] = NOW
+            master[k] = {
+                "company_name": name,
+                "city":    c.get("city", ""),
+                "email":   c.get("email", ""),
+                "phone":   c.get("phone", ""),
+                "website": c.get("website", ""),
+                "first_seen": NOW,
+            }
             added += 1
         else:
             for f in ["city", "email", "phone", "website"]:
@@ -178,36 +150,19 @@ def save(rows: list[dict], path: str):
         w.writeheader()
         w.writerows(rows)
 
-# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     idx     = RUN_NUM % len(BATCHES)
     queries = BATCHES[idx]
-    print(f"=== Run #{RUN_NUM} | {NOW} | Batch {idx} ===\n")
+    print(f"=== Run #{RUN_NUM} | {NOW} | Batch {idx} | {len(queries)} requêtes ===\n")
 
     all_found = []
-
-    # 1. Google scraping
     for i, q in enumerate(queries, 1):
-        print(f"[Google {i}/{len(queries)}] {q[:65]}...")
-        results = google_search(q)
-        if results.strip():
-            found = extract(results)
-            print(f"  → {len(found)} entreprise(s)")
-            all_found.extend(found)
+        print(f"[{i}/{len(queries)}] {q[:70]}...")
+        found = search_and_extract(q)
+        print(f"  → {len(found)} entreprise(s) extraite(s)")
+        all_found.extend(found)
         time.sleep(3)
 
-    # 2. Annuaires directs éthiopiens
-    print(f"\n[Annuaires] Scraping {len(DIRECT_SOURCES)} sources...")
-    for url in DIRECT_SOURCES:
-        print(f"  {url[:60]}...")
-        text = scrape_directory(url)
-        if text.strip():
-            found = extract(text)
-            print(f"  → {len(found)} entreprise(s)")
-            all_found.extend(found)
-        time.sleep(2)
-
-    # 3. Fusion et sauvegarde
     master = load_master()
     master, added = merge(all_found, master)
     rows = sorted(master.values(), key=lambda r: r.get("company_name", "").lower())
