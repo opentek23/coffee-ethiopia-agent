@@ -1,141 +1,131 @@
 """
 Agent prospection café Éthiopie
-Outil utilisé : web_search intégré à l'API Anthropic (aucun service tiers)
-Résultat     : data/companies_master.csv  (cumulatif, enrichi à chaque run)
-               data/companies_latest.csv  (résultats du run en cours)
+Recherche : DuckDuckGo (gratuit, sans clé)
+Extraction : Claude Anthropic API
+Résultat   : data/companies_master.csv + data/companies_latest.csv
 """
 
-import os, csv, json, hashlib, re
+import os, csv, json, hashlib, re, time
 from datetime import datetime
+import urllib.request, urllib.parse
 import anthropic
 
 # ── Config ────────────────────────────────────────────────────────────────────
-API_KEY    = os.environ["ANTHROPIC_API_KEY"]
-RUN_NUM    = int(os.environ.get("GITHUB_RUN_NUMBER", "0"))
-NOW        = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-DATA_DIR   = "data"
-MASTER_CSV = f"{DATA_DIR}/companies_master.csv"
-LATEST_CSV = f"{DATA_DIR}/companies_latest.csv"
-FIELDS     = ["company_name", "city", "email", "phone", "website", "first_seen"]
+API_KEY  = os.environ["ANTHROPIC_API_KEY"]
+RUN_NUM  = int(os.environ.get("GITHUB_RUN_NUMBER", "0"))
+NOW      = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+DATA_DIR = "data"
+MASTER   = f"{DATA_DIR}/companies_master.csv"
+LATEST   = f"{DATA_DIR}/companies_latest.csv"
+FIELDS   = ["company_name", "city", "email", "phone", "website", "first_seen"]
 
-# ── 8 angles de recherche en rotation ─────────────────────────────────────────
+# ── 8 batches de requêtes en rotation ─────────────────────────────────────────
 BATCHES = [
-    # 0 — export général
-    [
-        "Ethiopian coffee export companies with email and phone contact Addis Ababa",
-        "Ethiopia coffee trading company contact details email address",
-    ],
-    # 1 — régions Sidama / Yirgacheffe
-    [
-        "Sidama coffee company Ethiopia contact email phone number",
-        "Yirgacheffe coffee producer exporter Ethiopia email",
-    ],
-    # 2 — région Jimma / Kaffa
-    [
-        "Jimma coffee company Ethiopia contact phone email",
-        "Kaffa forest coffee Ethiopia exporter contact",
-    ],
-    # 3 — coopératives
-    [
-        "Ethiopian coffee farmers cooperative union email contact",
-        "Oromia coffee cooperative Ethiopia phone number",
-    ],
-    # 4 — torréfacteurs
-    [
-        "coffee roaster Ethiopia specialty coffee company email",
-        "Ethiopian coffee roasting company contact details",
-    ],
-    # 5 — emballage / packaging
-    [
-        "coffee packaging supplier Ethiopia company contact email",
-        "Ethiopia coffee bag manufacturer phone email",
-    ],
-    # 6 — annuaires et chambres de commerce
-    [
-        "Ethiopia chamber of commerce coffee company directory contact",
-        "Addis Ababa coffee company business directory email phone",
-    ],
-    # 7 — importateurs / green bean
-    [
-        "green coffee bean supplier Ethiopia contact email phone",
-        "Ethiopia coffee importer wholesale company contact",
-    ],
+    ["Ethiopian coffee export company contact email phone",
+     "Ethiopia coffee trading company Addis Ababa contact"],
+    ["Sidama coffee company Ethiopia email phone",
+     "Yirgacheffe coffee producer exporter Ethiopia contact"],
+    ["Jimma coffee Ethiopia company phone email",
+     "Kaffa coffee Ethiopia exporter contact details"],
+    ["Ethiopian coffee farmers cooperative union contact email",
+     "Oromia coffee cooperative Ethiopia phone"],
+    ["coffee roaster Ethiopia company email contact",
+     "specialty coffee Ethiopia roasting company phone"],
+    ["coffee packaging supplier Ethiopia email contact",
+     "Ethiopia coffee bag manufacturer phone"],
+    ["Ethiopia chamber commerce coffee company directory",
+     "Addis Ababa coffee business directory email phone"],
+    ["green coffee bean supplier Ethiopia email phone",
+     "Ethiopia coffee importer wholesale contact"],
 ]
 
+# ── DuckDuckGo HTML scrape (sans clé) ─────────────────────────────────────────
+def search(query: str) -> str:
+    try:
+        q = urllib.parse.quote_plus(query)
+        url = f"https://html.duckduckgo.com/html/?q={q}"
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        })
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
 
-# ── Prompt envoyé à Claude ─────────────────────────────────────────────────────
-def make_prompt(query: str) -> str:
-    return f"""Recherche sur le web : "{query}"
+        snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', html, re.DOTALL)
+        titles   = re.findall(r'class="result__title".*?<a[^>]*>(.*?)</a>', html, re.DOTALL)
+        urls     = re.findall(r'class="result__url"[^>]*>(.*?)</span>', html, re.DOTALL)
 
-Après ta recherche, extrais TOUTES les entreprises éthiopiennes liées au café
-(producteurs, exportateurs, coopératives, torréfacteurs, fournisseurs d'emballage).
+        parts = []
+        for i in range(min(len(snippets), 8)):
+            t = re.sub(r"<[^>]+>", "", titles[i]).strip()   if i < len(titles)   else ""
+            s = re.sub(r"<[^>]+>", "", snippets[i]).strip()
+            u = urls[i].strip()                              if i < len(urls)     else ""
+            if t: parts.append(f"Titre: {t}")
+            if s: parts.append(f"Extrait: {s}")
+            if u: parts.append(f"URL: {u}")
+            parts.append("---")
 
-Réponds UNIQUEMENT avec un bloc JSON valide entre balises <json> et </json>, sans autre texte :
+        result = "\n".join(parts)
+        print(f"  → {len(snippets)} résultats récupérés")
+        return result
+    except Exception as e:
+        print(f"  ⚠ Recherche : {e}")
+        return ""
+
+# ── Extraction Claude ──────────────────────────────────────────────────────────
+PROMPT = """Voici des résultats de recherche sur : "{query}"
+
+{results}
+
+Extrais TOUTES les entreprises éthiopiennes liées au café (producteurs, exportateurs,
+coopératives, torréfacteurs, emballage café).
+
+Réponds UNIQUEMENT avec du JSON valide entre <json> et </json> :
 
 <json>
 [
   {{
     "company_name": "Nom exact",
     "city": "Ville en Ethiopie ou vide",
-    "email": "email@exemple.com ou vide",
+    "email": "email ou vide",
     "phone": "+251... ou vide",
     "website": "https://... ou vide"
   }}
 ]
 </json>
 
-Règles strictes :
-- Ne jamais inventer une donnée — laisser le champ vide si inconnu
-- Inclure uniquement des entreprises basées en Éthiopie
-- Si aucune entreprise trouvée : <json>[]</json>"""
+Ne jamais inventer — laisser vide si inconnu. Si rien trouvé : <json>[]</json>"""
 
 
-# ── Appel API avec web_search ──────────────────────────────────────────────────
-def search_and_extract(query: str) -> list[dict]:
+def extract(query: str, results_text: str) -> list[dict]:
+    if not results_text.strip():
+        return []
     client = anthropic.Anthropic(api_key=API_KEY)
     try:
-        response = client.messages.create(
+        resp = client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=2000,
-            tools=[{"type": "web_search_20250305", "name": "web_search"}],
-            messages=[{"role": "user", "content": make_prompt(query)}],
+            messages=[{"role": "user", "content": PROMPT.format(
+                query=query, results=results_text[:4000]
+            )}],
         )
-
-        # Récupérer le texte final de la réponse
-        full_text = ""
-        for block in response.content:
-            if hasattr(block, "text"):
-                full_text += block.text
-
-        # Extraire le JSON entre <json> et </json>
-        match = re.search(r"<json>(.*?)</json>", full_text, re.DOTALL)
+        text = resp.content[0].text
+        match = re.search(r"<json>(.*?)</json>", text, re.DOTALL)
         if not match:
-            print(f"  ⚠ Pas de balise <json> dans la réponse")
             return []
-
         return json.loads(match.group(1).strip())
-
     except Exception as e:
-        print(f"  ⚠ Erreur API : {e}")
+        print(f"  ⚠ Claude : {e}")
         return []
 
-
-# ── CSV master : chargement et fusion ─────────────────────────────────────────
-def load_master() -> dict:
-    existing = {}
-    if not os.path.exists(MASTER_CSV):
-        return existing
-    with open(MASTER_CSV, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            k = _key(row.get("company_name", ""))
-            if k:
-                existing[k] = row
-    return existing
-
-
+# ── CSV master ────────────────────────────────────────────────────────────────
 def _key(name: str) -> str:
     return hashlib.md5(name.lower().strip().encode()).hexdigest()
 
+def load_master() -> dict:
+    if not os.path.exists(MASTER):
+        return {}
+    with open(MASTER, newline="", encoding="utf-8") as f:
+        return {_key(r["company_name"]): r for r in csv.DictReader(f) if r.get("company_name")}
 
 def merge(new_items: list[dict], master: dict) -> tuple[dict, int]:
     added = 0
@@ -147,54 +137,53 @@ def merge(new_items: list[dict], master: dict) -> tuple[dict, int]:
         if k not in master:
             master[k] = {
                 "company_name": name,
-                "city":        c.get("city", ""),
-                "email":       c.get("email", ""),
-                "phone":       c.get("phone", ""),
-                "website":     c.get("website", ""),
-                "first_seen":  NOW,
+                "city":    c.get("city", ""),
+                "email":   c.get("email", ""),
+                "phone":   c.get("phone", ""),
+                "website": c.get("website", ""),
+                "first_seen": NOW,
             }
             added += 1
         else:
-            # Enrichir les champs vides
             for f in ["city", "email", "phone", "website"]:
                 if not master[k].get(f) and c.get(f):
                     master[k][f] = c[f]
     return master, added
 
-
-def save_csv(rows: list[dict], path: str):
+def save(rows: list[dict], path: str):
     os.makedirs(DATA_DIR, exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=FIELDS)
         w.writeheader()
         w.writerows(rows)
 
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    batch_idx = RUN_NUM % len(BATCHES)
-    queries   = BATCHES[batch_idx]
-
-    print(f"=== Run #{RUN_NUM} | {NOW} | Batch {batch_idx} ===")
-    print(f"    {len(queries)} requête(s) ce run\n")
+    idx     = RUN_NUM % len(BATCHES)
+    queries = BATCHES[idx]
+    print(f"=== Run #{RUN_NUM} | {NOW} | Batch {idx} | {len(queries)} requêtes ===\n")
 
     all_found = []
     for i, q in enumerate(queries, 1):
-        print(f"[{i}/{len(queries)}] {q[:72]}...")
-        found = search_and_extract(q)
+        print(f"[{i}/{len(queries)}] {q[:70]}...")
+        results = search(q)
+        if not results.strip():
+            print("  → Aucun résultat")
+            time.sleep(2)
+            continue
+        found = extract(q, results)
         print(f"  → {len(found)} entreprise(s) extraite(s)")
         all_found.extend(found)
+        time.sleep(2)
 
     master = load_master()
     master, added = merge(all_found, master)
-
     rows = sorted(master.values(), key=lambda r: r.get("company_name", "").lower())
-    save_csv(rows, MASTER_CSV)
-    save_csv(rows, LATEST_CSV)
+    save(rows, MASTER)
+    save(rows, LATEST)
 
-    print(f"\n  +{added} nouvelles | Total cumulé : {len(master)} entreprises")
+    print(f"\n  +{added} nouvelles | Total : {len(master)} entreprises")
     print("✅ Run terminé.")
-
 
 if __name__ == "__main__":
     main()
