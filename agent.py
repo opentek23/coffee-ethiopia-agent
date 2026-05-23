@@ -1,13 +1,14 @@
 """
 Agent prospection café Éthiopie
-Recherche : DuckDuckGo (gratuit, sans clé)
-Extraction : Claude Anthropic API
-Résultat   : data/companies_master.csv + data/companies_latest.csv
+Scraping direct : Google + annuaires éthiopiens
+Bibliothèques  : requests + beautifulsoup4 (100% gratuit, zéro clé)
+Résultat       : data/companies_master.csv + data/companies_latest.csv
 """
 
 import os, csv, json, hashlib, re, time
 from datetime import datetime
-import urllib.request, urllib.parse
+import requests
+from bs4 import BeautifulSoup
 import anthropic
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -19,7 +20,13 @@ MASTER   = f"{DATA_DIR}/companies_master.csv"
 LATEST   = f"{DATA_DIR}/companies_latest.csv"
 FIELDS   = ["company_name", "city", "email", "phone", "website", "first_seen"]
 
-# ── 8 batches de requêtes en rotation ─────────────────────────────────────────
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+# ── 8 batches de requêtes en rotation ────────────────────────────────────────
 BATCHES = [
     ["Ethiopian coffee export company contact email phone",
      "Ethiopia coffee trading company Addis Ababa contact"],
@@ -33,46 +40,67 @@ BATCHES = [
      "specialty coffee Ethiopia roasting company phone"],
     ["coffee packaging supplier Ethiopia email contact",
      "Ethiopia coffee bag manufacturer phone"],
-    ["Ethiopia chamber commerce coffee company directory",
+    ["Ethiopia coffee company directory yellowpages",
      "Addis Ababa coffee business directory email phone"],
     ["green coffee bean supplier Ethiopia email phone",
-     "Ethiopia coffee importer wholesale contact"],
+     "Ethiopia coffee wholesale exporter contact"],
 ]
 
-# ── DuckDuckGo HTML scrape (sans clé) ─────────────────────────────────────────
-def search(query: str) -> str:
-    try:
-        q = urllib.parse.quote_plus(query)
-        url = f"https://html.duckduckgo.com/html/?q={q}"
-        req = urllib.request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        })
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            html = resp.read().decode("utf-8", errors="ignore")
+# Sources directes à scraper
+DIRECT_SOURCES = [
+    "https://www.yellowpages.com.et/search?keyword=coffee",
+    "https://www.addisbiz.com/search?q=coffee",
+    "https://ethiopianbusinessdirectory.com/coffee",
+    "https://www.biznet.et/search/coffee",
+]
 
-        snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', html, re.DOTALL)
-        titles   = re.findall(r'class="result__title".*?<a[^>]*>(.*?)</a>', html, re.DOTALL)
-        urls     = re.findall(r'class="result__url"[^>]*>(.*?)</span>', html, re.DOTALL)
+# ── Google scrape ─────────────────────────────────────────────────────────────
+def google_search(query: str) -> str:
+    try:
+        q = requests.utils.quote(query)
+        url = f"https://www.google.com/search?q={q}&num=10&hl=en"
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        soup = BeautifulSoup(resp.text, "html.parser")
 
         parts = []
-        for i in range(min(len(snippets), 8)):
-            t = re.sub(r"<[^>]+>", "", titles[i]).strip()   if i < len(titles)   else ""
-            s = re.sub(r"<[^>]+>", "", snippets[i]).strip()
-            u = urls[i].strip()                              if i < len(urls)     else ""
-            if t: parts.append(f"Titre: {t}")
-            if s: parts.append(f"Extrait: {s}")
-            if u: parts.append(f"URL: {u}")
+        # Titres + snippets des résultats organiques
+        for g in soup.select("div.g")[:10]:
+            title = g.select_one("h3")
+            snippet = g.select_one("div.VwiC3b") or g.select_one("span.aCOpRe")
+            link = g.select_one("a")
+            if title:
+                parts.append(f"Titre: {title.get_text()}")
+            if snippet:
+                parts.append(f"Extrait: {snippet.get_text()}")
+            if link and link.get("href","").startswith("http"):
+                parts.append(f"URL: {link['href']}")
             parts.append("---")
 
         result = "\n".join(parts)
-        print(f"  → {len(snippets)} résultats récupérés")
+        print(f"  → Google : {len(soup.select('div.g'))} résultats")
         return result
     except Exception as e:
-        print(f"  ⚠ Recherche : {e}")
+        print(f"  ⚠ Google : {e}")
         return ""
 
-# ── Extraction Claude ──────────────────────────────────────────────────────────
-PROMPT = """Voici des résultats de recherche sur : "{query}"
+# ── Scrape annuaires directs ───────────────────────────────────────────────────
+def scrape_directory(url: str) -> str:
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        if resp.status_code != 200:
+            return ""
+        soup = BeautifulSoup(resp.text, "html.parser")
+        # Extraire tout le texte visible
+        text = soup.get_text(separator="\n", strip=True)
+        # Garder seulement les lignes utiles (email, phone, nom)
+        lines = [l for l in text.splitlines() if len(l) > 5][:80]
+        return "\n".join(lines)
+    except Exception as e:
+        print(f"  ⚠ Annuaire {url} : {e}")
+        return ""
+
+# ── Extraction Claude ─────────────────────────────────────────────────────────
+PROMPT = """Voici des résultats de recherche sur les entreprises éthiopiennes du café.
 
 {results}
 
@@ -95,8 +123,7 @@ Réponds UNIQUEMENT avec du JSON valide entre <json> et </json> :
 
 Ne jamais inventer — laisser vide si inconnu. Si rien trouvé : <json>[]</json>"""
 
-
-def extract(query: str, results_text: str) -> list[dict]:
+def extract(results_text: str) -> list[dict]:
     if not results_text.strip():
         return []
     client = anthropic.Anthropic(api_key=API_KEY)
@@ -105,7 +132,7 @@ def extract(query: str, results_text: str) -> list[dict]:
             model="claude-sonnet-4-20250514",
             max_tokens=2000,
             messages=[{"role": "user", "content": PROMPT.format(
-                query=query, results=results_text[:4000]
+                results=results_text[:5000]
             )}],
         )
         text = resp.content[0].text
@@ -135,14 +162,8 @@ def merge(new_items: list[dict], master: dict) -> tuple[dict, int]:
             continue
         k = _key(name)
         if k not in master:
-            master[k] = {
-                "company_name": name,
-                "city":    c.get("city", ""),
-                "email":   c.get("email", ""),
-                "phone":   c.get("phone", ""),
-                "website": c.get("website", ""),
-                "first_seen": NOW,
-            }
+            master[k] = {f: c.get(f, "") for f in FIELDS[:-1]}
+            master[k]["first_seen"] = NOW
             added += 1
         else:
             for f in ["city", "email", "phone", "website"]:
@@ -161,21 +182,32 @@ def save(rows: list[dict], path: str):
 def main():
     idx     = RUN_NUM % len(BATCHES)
     queries = BATCHES[idx]
-    print(f"=== Run #{RUN_NUM} | {NOW} | Batch {idx} | {len(queries)} requêtes ===\n")
+    print(f"=== Run #{RUN_NUM} | {NOW} | Batch {idx} ===\n")
 
     all_found = []
+
+    # 1. Google scraping
     for i, q in enumerate(queries, 1):
-        print(f"[{i}/{len(queries)}] {q[:70]}...")
-        results = search(q)
-        if not results.strip():
-            print("  → Aucun résultat")
-            time.sleep(2)
-            continue
-        found = extract(q, results)
-        print(f"  → {len(found)} entreprise(s) extraite(s)")
-        all_found.extend(found)
+        print(f"[Google {i}/{len(queries)}] {q[:65]}...")
+        results = google_search(q)
+        if results.strip():
+            found = extract(results)
+            print(f"  → {len(found)} entreprise(s)")
+            all_found.extend(found)
+        time.sleep(3)
+
+    # 2. Annuaires directs éthiopiens
+    print(f"\n[Annuaires] Scraping {len(DIRECT_SOURCES)} sources...")
+    for url in DIRECT_SOURCES:
+        print(f"  {url[:60]}...")
+        text = scrape_directory(url)
+        if text.strip():
+            found = extract(text)
+            print(f"  → {len(found)} entreprise(s)")
+            all_found.extend(found)
         time.sleep(2)
 
+    # 3. Fusion et sauvegarde
     master = load_master()
     master, added = merge(all_found, master)
     rows = sorted(master.values(), key=lambda r: r.get("company_name", "").lower())
